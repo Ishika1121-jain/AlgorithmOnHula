@@ -1,212 +1,199 @@
-# Copyright 2017-present Open Networking Foundation
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-import re
+#!/usr/bin/env python3
+"""
+P4Runtime helper that loads ONLY local protobufs from build/
+and provides a buildTableEntry(...) compatible with the controller.
+Drop this file into utils/p4runtime_lib/helper.py (replace existing file).
+"""
 
-import google.protobuf.text_format
-from p4 import p4runtime_pb2
-from p4.config import p4info_pb2
+import os
+import sys
+import importlib.util
+from google.protobuf import text_format
 
-from convert import encode
+# --- locate build dir (where generated pb2 files live) ---
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+BUILD_DIR = os.path.join(BASE_DIR, "build")
+
+if BUILD_DIR not in sys.path:
+    sys.path.insert(0, BUILD_DIR)
+
+
+def _load_module_from_file(name, filepath):
+    """Load module by path (avoids importing system-installed packages)."""
+    if not os.path.isfile(filepath):
+        raise ImportError(f"Missing file: {filepath}")
+    spec = importlib.util.spec_from_file_location(name, filepath)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# --- load local generated protobuf modules ---
+p4runtime_pb2 = _load_module_from_file("p4runtime_pb2", os.path.join(BUILD_DIR, "p4runtime_pb2.py"))
+p4info_pb2 = _load_module_from_file("p4info_pb2", os.path.join(BUILD_DIR, "p4info_pb2.py"))
+
+# --- local convert utility (encode/decode helpers) ---
+_convert_path = os.path.join(os.path.dirname(__file__), "convert.py")
+convert = _load_module_from_file("p4runtime_convert", _convert_path)
+
 
 class P4InfoHelper(object):
-    def __init__(self, p4_info_filepath):
-        p4info = p4info_pb2.P4Info()
-        # Load the p4info file into a skeleton P4Info object
-        with open(p4_info_filepath) as p4info_f:
-            google.protobuf.text_format.Merge(p4info_f.read(), p4info)
-        self.p4info = p4info
+    """
+    Lightweight helper to read text-format p4info and build P4Runtime table entries.
+    Compatible call used by controller:
+        buildTableEntry(table_name="MyIngress.table", match_fields={...}, action_name="...", action_params={...})
+    """
 
-    def get(self, entity_type, name=None, id=None):
-        if name is not None and id is not None:
-            raise AssertionError("name or id must be None")
+    def __init__(self, p4info_txt_path):
+        if not os.path.isfile(p4info_txt_path):
+            raise FileNotFoundError(f"p4info text file not found: {p4info_txt_path}")
 
-        for o in getattr(self.p4info, entity_type):
-            pre = o.preamble
-            if name:
-                if (pre.name == name or pre.alias == name):
-                    return o
-            else:
-                if pre.id == id:
-                    return o
+        # load text-format P4Info into protobuf message
+        self.p4info = p4info_pb2.P4Info()
+        with open(p4info_txt_path, "r") as f:
+            text_format.Merge(f.read(), self.p4info)
 
-        if name:
-            raise AttributeError("Could not find %r of type %s" % (name, entity_type))
-        else:
-            raise AttributeError("Could not find id %r of type %s" % (id, entity_type))
+    # Generic lookup helpers ------------------------------------------------
 
-    def get_id(self, entity_type, name):
-        return self.get(entity_type, name=name).preamble.id
+    def get(self, entity, name=None, id=None):
+        """Return the proto object of `entity` (e.g. 'tables', 'actions') by name or id."""
+        for e in getattr(self.p4info, entity):
+            pre = e.preamble
+            if name and (pre.name == name or getattr(pre, "alias", None) == name):
+                return e
+            if id is not None and pre.id == id:
+                return e
+        raise KeyError(f"{entity} not found (name={name} id={id})")
 
-    def get_name(self, entity_type, id):
-        return self.get(entity_type, id=id).preamble.name
+    def get_id(self, entity, name):
+        return self.get(entity, name=name).preamble.id
 
-    def get_alias(self, entity_type, id):
-        return self.get(entity_type, id=id).preamble.alias
+    def get_name(self, entity, id):
+        return self.get(entity, id=id).preamble.name
 
     def __getattr__(self, attr):
-        # Synthesize convenience functions for name to id lookups for top-level entities
-        # e.g. get_tables_id(name_string) or get_actions_id(name_string)
-        m = re.search("^get_(\w+)_id$", attr)
+        """
+        Synthesize helpers like get_tables_id(name) or get_actions_id(name)
+        if called as self.get_tables_id("MyIngress.table").
+        """
+        import re
+        m = re.match(r"get_(\w+)_id$", attr)
         if m:
-            primitive = m.group(1)
-            return lambda name: self.get_id(primitive, name)
-
-        # Synthesize convenience functions for id to name lookups
-        # e.g. get_tables_name(id) or get_actions_name(id)
-        m = re.search("^get_(\w+)_name$", attr)
+            entity = m.group(1)
+            return lambda name: self.get_id(entity, name)
+        m = re.match(r"get_(\w+)_name$", attr)
         if m:
-            primitive = m.group(1)
-            return lambda id: self.get_name(primitive, id)
+            entity = m.group(1)
+            return lambda id: self.get_name(entity, id)
+        raise AttributeError(attr)
 
-        raise AttributeError("%r object has no attribute %r" % (self.__class__, attr))
+    # Match / action parameter helpers -------------------------------------
 
     def get_match_field(self, table_name, name=None, id=None):
+        """Return the match field proto from table by name or id."""
         for t in self.p4info.tables:
-            pre = t.preamble
-            if pre.name == table_name:
+            if t.preamble.name == table_name:
                 for mf in t.match_fields:
-                    if name is not None:
-                        if mf.name == name:
-                            return mf
-                    elif id is not None:
-                        if mf.id == id:
-                            return mf
-        raise AttributeError("%r has no attribute %r" % (table_name, name if name is not None else id))
-
-    def get_match_field_id(self, table_name, match_field_name):
-        return self.get_match_field(table_name, name=match_field_name).id
-
-    def get_match_field_name(self, table_name, match_field_id):
-        return self.get_match_field(table_name, id=match_field_id).name
-
-    def get_match_field_pb(self, table_name, match_field_name, value):
-        p4info_match = self.get_match_field(table_name, match_field_name)
-        bitwidth = p4info_match.bitwidth
-        p4runtime_match = p4runtime_pb2.FieldMatch()
-        p4runtime_match.field_id = p4info_match.id
-        match_type = p4info_match.match_type
-        if match_type == p4info_pb2.MatchField.VALID:
-            valid = p4runtime_match.valid
-            valid.value = bool(value)
-        elif match_type == p4info_pb2.MatchField.EXACT:
-            exact = p4runtime_match.exact
-            exact.value = encode(value, bitwidth)
-        elif match_type == p4info_pb2.MatchField.LPM:
-            lpm = p4runtime_match.lpm
-            lpm.value = encode(value[0], bitwidth)
-            lpm.prefix_len = value[1]
-        elif match_type == p4info_pb2.MatchField.TERNARY:
-            lpm = p4runtime_match.ternary
-            lpm.value = encode(value[0], bitwidth)
-            lpm.mask = encode(value[1], bitwidth)
-        elif match_type == p4info_pb2.MatchField.RANGE:
-            lpm = p4runtime_match.range
-            lpm.low = encode(value[0], bitwidth)
-            lpm.high = encode(value[1], bitwidth)
-        else:
-            raise Exception("Unsupported match type with type %r" % match_type)
-        return p4runtime_match
-
-    def get_match_field_value(self, match_field):
-        match_type = match_field.WhichOneof("field_match_type")
-        if match_type == 'valid':
-            return match_field.valid.value
-        elif match_type == 'exact':
-            return match_field.exact.value
-        elif match_type == 'lpm':
-            return (match_field.lpm.value, match_field.lpm.prefix_len)
-        elif match_type == 'ternary':
-            return (match_field.ternary.value, match_field.ternary.mask)
-        elif match_type == 'range':
-            return (match_field.range.low, match_field.range.high)
-        else:
-            raise Exception("Unsupported match type with type %r" % match_type)
+                    if name and mf.name == name:
+                        return mf
+                    if id is not None and mf.id == id:
+                        return mf
+        raise KeyError(f"Table {table_name} match field not found (name={name} id={id})")
 
     def get_action_param(self, action_name, name=None, id=None):
+        """Return the action param proto for action by name or id."""
         for a in self.p4info.actions:
-            pre = a.preamble
-            if pre.name == action_name:
+            if a.preamble.name == action_name:
                 for p in a.params:
-                    if name is not None:
-                        if p.name == name:
-                            return p
-                    elif id is not None:
-                        if p.id == id:
-                            return p
-        raise AttributeError("action %r has no param %r, (has: %r)" % (action_name, name if name is not None else id, a.params))
-
-    def get_action_param_id(self, action_name, param_name):
-        return self.get_action_param(action_name, name=param_name).id
-
-    def get_action_param_name(self, action_name, param_id):
-        return self.get_action_param(action_name, id=param_id).name
+                    if name and p.name == name:
+                        return p
+                    if id is not None and p.id == id:
+                        return p
+        raise KeyError(f"Action {action_name} param not found (name={name} id={id})")
 
     def get_action_param_pb(self, action_name, param_name, value):
-        p4info_param = self.get_action_param(action_name, param_name)
-        p4runtime_param = p4runtime_pb2.Action.Param()
-        p4runtime_param.param_id = p4info_param.id
-        p4runtime_param.value = encode(value, p4info_param.bitwidth)
-        return p4runtime_param
+        """Build a p4runtime Action.Param protobuf given the p4info param definition."""
+        ap = self.get_action_param(action_name, name=param_name)
+        p = p4runtime_pb2.Action.Param()
+        p.param_id = ap.id
+        p.value = convert.encode(value, ap.bitwidth)
+        return p
 
-    def buildMulticastGroupEntry(self,
-                                 mcast_grp_id,
-                                 ports=[]):
-        packet_rep_entry = p4runtime_pb2.PacketReplicationEngineEntry()
-        packet_rep_entry.multicast_group_entry.multicast_group_id = mcast_grp_id
+    # Table entry builders -------------------------------------------------
 
-        replicas = []
-        instance_id = 1
-        for egress_port in ports:
-            replica = p4runtime_pb2.MulticastGroupEntry.Replica()
-            replica.egress_port = egress_port
-            replica.instance = instance_id
-            instance_id += 1
-            replicas.append(replica)
-
-        packet_rep_entry.multicast_group_entry.replicas.extend(replicas)
-
-        return packet_rep_entry
+    def build_match_field_pb(self, table_name, field_name, value):
+        """Return a FieldMatch proto for a given table match field and value.
+           (This implementation assumes EXACT matches for the common simple case.)
+           If you need LPM/TERNARY/RANGE/VALID add branches using mf.match_type and mf.bitwidth.
+        """
+        mf = self.get_match_field(table_name, name=field_name)
+        fm = p4runtime_pb2.FieldMatch()
+        fm.field_id = mf.id
+        # simple default: exact match
+        fm.exact.value = convert.encode(value, mf.bitwidth)
+        return fm
 
     def buildTableEntry(self,
-                        table_name,
+                        table=None,
+                        table_name=None,
                         match_fields=None,
-                        default_action=False,
                         action_name=None,
                         action_params=None,
-                        priority=None):
-        table_entry = p4runtime_pb2.TableEntry()
-        table_entry.table_id = self.get_tables_id(table_name)
+                        priority=None,
+                        default_action=False):
+        """
+        Build and return a p4runtime_pb2.TableEntry.
 
-        if priority is not None:
-            table_entry.priority = priority
+        Accepts either `table` (old style positional) or `table_name` (keyword used by controller).
+        """
+        if table_name is None:
+            table_name = table
+        if table_name is None:
+            raise TypeError("buildTableEntry requires table_name= or table=")
 
+        te = p4runtime_pb2.TableEntry()
+        te.table_id = self.get_tables_id(table_name)
+
+        # match fields
         if match_fields:
-            table_entry.match.extend([
-                self.get_match_field_pb(table_name, match_field_name, value)
-                for match_field_name, value in match_fields.iteritems()
-            ])
+            for fname, val in match_fields.items():
+                fm = self.build_match_field_pb(table_name, fname, val)
+                te.match.append(fm)
 
-        if default_action:
-            table_entry.is_default_action = True
-
+        # action
         if action_name:
-            action = table_entry.action.action
-            action.action_id = self.get_actions_id(action_name)
+            act = te.action.action
+            act.action_id = self.get_actions_id(action_name)
             if action_params:
-                action.params.extend([
-                    self.get_action_param_pb(action_name, field_name, value)
-                    for field_name, value in action_params.iteritems()
-                ])
-        return table_entry
+                for pname, pval in action_params.items():
+                    act.params.append(self.get_action_param_pb(action_name, pname, pval))
+
+        # priority / default
+        if priority is not None:
+            te.priority = int(priority)
+        if default_action:
+            te.is_default_action = True
+
+        return te
+
+    def buildMulticastGroupEntry(self, mcast_grp_id, ports=None):
+        """
+        Build a PacketReplicationEngineEntry representing a multicast group.
+        - mcast_grp_id: integer multicast group id (we used ingress port id earlier)
+        - ports: iterable/list of egress port numbers
+        Returns a p4runtime_pb2.PacketReplicationEngineEntry instance.
+        """
+        if ports is None:
+            ports = []
+
+        entry = p4runtime_pb2.PacketReplicationEngineEntry()
+        entry.multicast_group_entry.multicast_group_id = int(mcast_grp_id)
+
+        # add replicas. instance numbers must be unique per replica — enumerate from 1
+        for idx, egress_port in enumerate(ports, start=1):
+            replica = entry.multicast_group_entry.replicas.add()
+            replica.egress_port = int(egress_port)
+            replica.instance = idx
+
+        return entry
+

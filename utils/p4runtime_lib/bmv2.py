@@ -12,19 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from switch import SwitchConnection
-from p4.tmp import p4config_pb2
 
+from switch import SwitchConnection
+
+# NOTE:
+# BMv2 does NOT use any protobuf device_config wrapper.
+# It expects raw JSON bytes in SetForwardingPipelineConfig.config.p4_device_config
 
 def buildDeviceConfig(bmv2_json_file_path=None):
-    "Builds the device config for BMv2"
-    device_config = p4config_pb2.P4DeviceConfig()
-    device_config.reassign = True
-    with open(bmv2_json_file_path) as f:
-        device_config.device_data = f.read()
-    return device_config
+    """Return the raw BMv2 JSON config as bytes."""
+    if bmv2_json_file_path is None:
+        return b""   # empty config (safe fallback)
 
+    with open(bmv2_json_file_path, "rb") as f:
+        return f.read()   # return raw binary JSON
 
 class Bmv2SwitchConnection(SwitchConnection):
+    """BMv2-specific switch connection."""
+    
     def buildDeviceConfig(self, **kwargs):
+        # kwargs should contain 'bmv2_json_file_path'
         return buildDeviceConfig(**kwargs)
+

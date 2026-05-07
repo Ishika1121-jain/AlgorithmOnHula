@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import argparse
 import sys
 import time
@@ -18,7 +18,7 @@ def get_if():
             iface=i
             break;
     if not iface:
-        print "Cannot find eth0 interface"
+        print ("Cannot find eth0 interface")
         exit(1)
     return iface
 
@@ -34,7 +34,7 @@ def main():
     count = 1
 
     if len(sys.argv)<3:
-        print 'pass 2 arguments: <destination> "<message>"'
+        print ('pass 2 arguments: <destination> "<message>"')
         exit(1)
 
     if len(sys.argv) == 4:
@@ -43,7 +43,7 @@ def main():
     addr = socket.gethostbyname(sys.argv[1])
     iface = get_if()
 
-    print "sending on interface %s to %s" % (iface, str(addr))
+    print ("sending on interface %s to %s" % (iface, str(addr)))
 
     # The check is intentially in place to allow for infinite loops
     while count != 0:

@@ -178,7 +178,7 @@ def monitor_stability(switches):
 
         with open(INTERVAL_FILE, "w") as f:
             f.write(str(current_interval))
-        
+
         time.sleep(CHECK_INTERVAL)
 
 

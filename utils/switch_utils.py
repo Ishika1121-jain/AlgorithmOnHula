@@ -8,7 +8,7 @@ def run_ssc_cmd(switch, cmd, debug=True):
     switch_port = 9090 + int(switch_reg.search(switch).group(1))
     cmd = "simple_switch_CLI --thrift-port %d <<EOF \n%s EOF" % (switch_port, cmd)
     if debug:
-        print "Running", cmd
+        print ("Running", cmd)
     out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True)
     return out
 
@@ -19,11 +19,11 @@ def printGrpcError(e):
     :param e: the error object
     """
 
-    print "gRPC Error:", e.details(),
+    print ("gRPC Error:", e.details(),)
     status_code = e.code()
-    print "(%s)" % status_code.name,
+    print ("(%s)" % status_code.name,)
     traceback = sys.exc_info()[2]
-    print "[%s:%d]" % (traceback.tb_frame.f_code.co_filename, traceback.tb_lineno)
+    print ("[%s:%d]" % (traceback.tb_frame.f_code.co_filename, traceback.tb_lineno))
 
 def load_topology(topo_file_path):
     """

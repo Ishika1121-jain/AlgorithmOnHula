@@ -69,7 +69,7 @@ class P4RuntimeSwitch(P4Switch):
             s_num = int(switch_regex.search(name).group(1))
             self.thrift_port = 9090 + s_num
 
-        print "Binding", name, "to thrift port", self.thrift_port
+        print ("Binding", name, "to thrift port", self.thrift_port)
 
         if check_listening_on_port(self.grpc_port):
             error('%s cannot bind port %d because it is bound by another process\n' % (self.name, self.grpc_port))

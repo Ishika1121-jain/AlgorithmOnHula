@@ -25,15 +25,39 @@ const time_t FLOWLET_TOUT = 48w1 << 3;
 const util_t PROBE_FREQ_FACTOR = 6;
 const time_t KEEP_ALIVE_THRESH = 48w1 << PROBE_FREQ_FACTOR;
 const time_t PROBE_FREQ = 48w1 << PROBE_FREQ_FACTOR; // Here for documentation. Unused.
+const util_t UTIL_CHANGE_THRESH = 8;
 
 /*************************************************************************
 *********************** H E A D E R S  ***********************************
 *************************************************************************/
 
+const bit<8> AGG_SIZE = 4;
+
 header hula_t {
-    bit<24> dst_tor;
-    bit<8> path_util;
+    bit<24> dst_tor0;
+    bit<8>  path_util0;
+
+    bit<24> dst_tor1;
+    bit<8>  path_util1;
+
+    bit<24> dst_tor2;
+    bit<8>  path_util2;
+
+    bit<24> dst_tor3;
+    bit<8>  path_util3;
+    
+    // Telemetry: queue depth (in bytes, max 255)
+    bit<8>  queue_depth;
+    
+    // Telemetry: TX Link Utilization (INT spec: units of 1/256 of link bandwidth, 0-255 scale)
+    bit<8>  tx_link_util;
+    
+    // Telemetry: Flow Completion Time (FCT) tracking
+    bit<48> flow_start_time;    // When flow was first seen (ingress_global_timestamp)
+    bit<48> flow_current_time;  // Current packet's timestamp (ingress_global_timestamp)
 }
+
+
 
 header ethernet_t {
     macAddr_t dstAddr;
@@ -147,6 +171,7 @@ control MyIngress(inout headers hdr,
     register<util_t>((bit<32>) NUM_PORTS) port_util;
     // Last time port_util was updated for a port.
     register<time_t>((bit<32>) NUM_PORTS) port_util_last_updated;
+    
     // Keep track of the last time a probe from dst_tor came.
     register<time_t>((bit<32>) NUM_TORS) update_time;
     // Best hop for for each tor
@@ -157,9 +182,46 @@ control MyIngress(inout headers hdr,
     register<port_id_t>((bit<32>) 1024) flowlet_hop;
     // Keep track of the minimum utilized path
     register<util_t>((bit<32>) NUM_TORS) min_path_util;
+    
+    // NEW: FCT Flow Tracking Registers
+    // Store flow start time (first packet timestamp) indexed by flow hash
+    register<time_t>((bit<32>) 1024) flow_start_time_reg;
 
     action drop() {
         mark_to_drop(standard_metadata);
+    }
+
+    /******************************************************/
+    
+    /**** NEW: Flow Completion Time (FCT) Tracking *****/
+    action track_flow_fct() {
+        // Compute flow hash based on 5-tuple
+        bit<32> flow_hash;
+        hash(flow_hash, HashAlgorithm.csum16, 32w0, {
+            hdr.ipv4.srcAddr,
+            hdr.ipv4.dstAddr,
+            hdr.ipv4.protocol,
+            hdr.tcp.srcPort,
+            hdr.tcp.dstPort
+        }, 32w1 << 10 - 1);
+        
+        time_t curr_time = standard_metadata.ingress_global_timestamp;
+        time_t flow_start;
+        
+        // Read the stored flow start time
+        flow_start_time_reg.read(flow_start, flow_hash);
+        
+        // If flow_start is 0, this is the first packet of the flow
+        // Record current time as flow start
+        bool is_new_flow = (flow_start == 0);
+        time_t start_time = is_new_flow ? curr_time : flow_start;
+        flow_start_time_reg.write(flow_hash, start_time);
+        
+        // Store FCT information in telemetry header
+        if (hdr.hula.isValid()) {
+            hdr.hula.flow_start_time = start_time;
+            hdr.hula.flow_current_time = curr_time;
+        }
     }
 
     /******************************************************/
@@ -168,44 +230,137 @@ control MyIngress(inout headers hdr,
 
     action hula_handle_probe() {
         time_t curr_time = standard_metadata.ingress_global_timestamp;
-        bit<32> dst_tor = (bit<32>) hdr.hula.dst_tor;
-
         util_t tx_util;
-        util_t mpu;
-        time_t up_time;
-
         port_util.read(tx_util, (bit<32>) standard_metadata.ingress_port);
-        min_path_util.read(mpu, dst_tor);
-        update_time.read(up_time, dst_tor);
+        
 
-        // If the current link util is higher, then that is the path util.
-        if(hdr.hula.path_util < tx_util) {
-            hdr.hula.path_util = tx_util;
+        /* ---------- ENTRY 0 ---------- */
+        {
+            bit<32> dst = (bit<32>) hdr.hula.dst_tor0;
+
+            util_t mpu;
+            time_t up_time;
+
+            min_path_util.read(mpu, dst);
+            update_time.read(up_time, dst);
+
+            util_t new_util = hdr.hula.path_util0;
+            new_util = (new_util < tx_util) ? tx_util : new_util;
+
+
+            bool cond = (new_util < mpu ||
+                        curr_time - up_time > KEEP_ALIVE_THRESH);
+
+            mpu = cond ? new_util : mpu;
+            min_path_util.write(dst, mpu);
+
+            up_time = cond ? curr_time : up_time;
+            update_time.write(dst, up_time);
+
+            port_id_t bh;
+            best_hop.read(bh, dst);
+            bh = cond ? standard_metadata.ingress_port : bh;
+            best_hop.write(dst, bh);
+
+            hdr.hula.path_util0 = mpu;
         }
 
-        // If the path util from probe is lower than minimum path util,
-        // update best hop.
-        bool cond = (hdr.hula.path_util < mpu || curr_time - up_time > KEEP_ALIVE_THRESH);
+        /* ---------- ENTRY 1 ---------- */
+        {
+            bit<32> dst = (bit<32>) hdr.hula.dst_tor1;
 
-        mpu = cond ? hdr.hula.path_util : mpu;
-        min_path_util.write(dst_tor, mpu);
+            util_t mpu;
+            time_t up_time;
 
-        up_time = cond ? curr_time : up_time;
-        update_time.write(dst_tor, up_time);
+            min_path_util.read(mpu, dst);
+            update_time.read(up_time, dst);
 
-        port_id_t bh_temp;
-        best_hop.read(bh_temp, dst_tor);
-        bh_temp = cond ? standard_metadata.ingress_port : bh_temp;
-        best_hop.write(dst_tor, bh_temp);
+            util_t new_util = hdr.hula.path_util1;
+            new_util = (new_util < tx_util) ? tx_util : new_util;
+
+            bool cond = (new_util < mpu ||
+                        curr_time - up_time > KEEP_ALIVE_THRESH);
+
+            mpu = cond ? new_util : mpu;
+            min_path_util.write(dst, mpu);
+
+            up_time = cond ? curr_time : up_time;
+            update_time.write(dst, up_time);
+
+            port_id_t bh;
+            best_hop.read(bh, dst);
+            bh = cond ? standard_metadata.ingress_port : bh;
+            best_hop.write(dst, bh);
+
+            hdr.hula.path_util1 = mpu;
+        }
+
+        /* ---------- ENTRY 2 ---------- */
+        {
+            bit<32> dst = (bit<32>) hdr.hula.dst_tor2;
+
+            util_t mpu;
+            time_t up_time;
+
+            min_path_util.read(mpu, dst);
+            update_time.read(up_time, dst);
+
+            util_t new_util = hdr.hula.path_util2;
+            new_util = (new_util < tx_util) ? tx_util : new_util;
 
 
-        min_path_util.read(mpu, dst_tor);
-        hdr.hula.path_util = mpu;
+            bool cond = (new_util < mpu ||
+                        curr_time - up_time > KEEP_ALIVE_THRESH);
+
+            mpu = cond ? new_util : mpu;
+            min_path_util.write(dst, mpu);
+
+            up_time = cond ? curr_time : up_time;
+            update_time.write(dst, up_time);
+
+            port_id_t bh;
+            best_hop.read(bh, dst);
+            bh = cond ? standard_metadata.ingress_port : bh;
+            best_hop.write(dst, bh);
+
+            hdr.hula.path_util2 = mpu;
+        }
+
+        /* ---------- ENTRY 3 ---------- */
+        {
+            bit<32> dst = (bit<32>) hdr.hula.dst_tor3;
+
+            util_t mpu;
+            time_t up_time;
+
+            min_path_util.read(mpu, dst);
+            update_time.read(up_time, dst);
+
+            util_t new_util = hdr.hula.path_util3;
+            new_util = (new_util < tx_util) ? tx_util : new_util;
+
+
+            bool cond = (new_util < mpu ||
+                        curr_time - up_time > KEEP_ALIVE_THRESH);
+
+            mpu = cond ? new_util : mpu;
+            min_path_util.write(dst, mpu);
+
+            up_time = cond ? curr_time : up_time;
+            update_time.write(dst, up_time);
+
+            port_id_t bh;
+            best_hop.read(bh, dst);
+            bh = cond ? standard_metadata.ingress_port : bh;
+            best_hop.write(dst, bh);
+
+            hdr.hula.path_util3 = mpu;
+        } 
     }
 
     action hula_handle_data_packet() {
         time_t curr_time = standard_metadata.ingress_global_timestamp;
-        bit<32> dst_tor = (bit<32>) hdr.hula.dst_tor;
+        bit<32> dst_tor = meta.dst_tor;
 
         util_t tx_util;
         port_util.read(tx_util, (bit<32>) standard_metadata.ingress_port);
@@ -215,6 +370,7 @@ control MyIngress(inout headers hdr,
         port_id_t flow_h;
         port_id_t best_h;
 
+        // Compute flow hash BEFORE modifying headers (while protocol is still TCP=0x06)
         hash(flow_hash, HashAlgorithm.csum16, 32w0, {
             hdr.ipv4.srcAddr,
             hdr.ipv4.dstAddr,
@@ -236,6 +392,24 @@ control MyIngress(inout headers hdr,
         flowlet_hop.read(flow_h, flow_hash);
         standard_metadata.egress_spec = flow_h;
         flowlet_time.write(flow_hash, curr_time);
+        
+        // NOW add HULA header to data packets for telemetry (after flow decision)
+        hdr.hula.setValid();
+        hdr.hula.dst_tor0 = 0;
+        hdr.hula.path_util0 = 0;
+        hdr.hula.dst_tor1 = 0;
+        hdr.hula.path_util1 = 0;
+        hdr.hula.dst_tor2 = 0;
+        hdr.hula.path_util2 = 0;
+        hdr.hula.dst_tor3 = 0;
+        hdr.hula.path_util3 = 0;
+        hdr.hula.queue_depth = 0;      // Will be populated in egress
+        hdr.hula.tx_link_util = 0;     // Will be populated in egress
+        hdr.hula.flow_start_time = curr_time;
+        hdr.hula.flow_current_time = curr_time;
+        
+        // Change protocol to HULA (0x42) to indicate telemetry header present
+        hdr.ipv4.protocol = PROTO_HULA;
     }
 
     table hula_logic {
@@ -305,16 +479,33 @@ control MyIngress(inout headers hdr,
 
       time_t curr_time = standard_metadata.ingress_global_timestamp;
       bit<32> port= (bit<32>) standard_metadata.ingress_port;
-
+      
       port_util.read(util, port);
       port_util_last_updated.read(last_update, port);
 
       bit<8> delta_t = (bit<8>) (curr_time - last_update);
-      util = (((bit<8>) standard_metadata.packet_length + util) << PROBE_FREQ_FACTOR) - delta_t;
-      util = util >> PROBE_FREQ_FACTOR;
+      util_t old_util = util;
 
-      port_util.write(port, util);
-      port_util_last_updated.write(port, curr_time);
+    util = (((bit<8>) standard_metadata.packet_length + util) << PROBE_FREQ_FACTOR) - delta_t;
+    util = util >> PROBE_FREQ_FACTOR;
+
+    port_util.write(port, util);
+    port_util_last_updated.write(port, curr_time);
+
+    /* --- NEW: Trigger faster refresh if utilization changed a lot --- */
+    bool trigger;
+
+    trigger = ((util > old_util && util - old_util > UTIL_CHANGE_THRESH) ||
+            (old_util > util && old_util - util > UTIL_CHANGE_THRESH));
+
+    time_t old_update;
+    update_time.read(old_update, (bit<32>) meta.dst_tor);
+
+    time_t new_update = trigger ? 0 : old_update;
+
+    update_time.write((bit<32>) meta.dst_tor, new_update);
+
+
     }
 
     apply {
@@ -322,6 +513,7 @@ control MyIngress(inout headers hdr,
         get_dst_tor.apply();
         update_ingress_statistics();
         if (hdr.ipv4.isValid()) {
+          track_flow_fct();  // NEW: Track FCT for every packet
           hula_logic.apply();
           if (hdr.hula.isValid()) {
             standard_metadata.mcast_grp = (bit<16>)standard_metadata.ingress_port;
@@ -340,7 +532,41 @@ control MyIngress(inout headers hdr,
 control MyEgress(inout headers hdr,
                  inout metadata meta,
                  inout standard_metadata_t standard_metadata) {
-    apply {  }
+    apply {
+        // Populate queue_depth telemetry from egress queue occupancy
+        // enq_qdepth: queue depth when packet arrived at egress queue
+        // deq_qdepth: queue depth when packet departed egress queue
+        // We use deq_qdepth (queue occupancy at dequeue time) as it shows current congestion
+        if (hdr.hula.isValid()) {
+            // Cast deq_qdepth to bit<8>. deq_qdepth is bit<19> in BMv2
+            // so we saturate to 0-255 range for telemetry
+            bit<19> queue_occ = standard_metadata.deq_qdepth;
+            // Saturating cast: if queue > 255, cap at 255
+            hdr.hula.queue_depth = (bit<8>)(queue_occ > 255 ? 255 : queue_occ);
+            
+            // Calculate TX Link Utilization (INT spec: 0-255 scale, 255 = 100% bandwidth utilization)
+            // Approach: Use queue-depth-based approximation
+            // avg_queue = (enq_qdepth + deq_qdepth) / 2
+            // tx_link_util = scaled avg_queue into 0-255 range
+            
+            bit<19> enq_q = standard_metadata.enq_qdepth;  // Queue depth at enqueue
+            bit<19> deq_q = standard_metadata.deq_qdepth;  // Queue depth at dequeue
+            
+            // Calculate average: (enq_qdepth + deq_qdepth) / 2
+            // Use bit<20> to avoid overflow during addition of two bit<19> values
+            bit<20> sum_q = (bit<20>)enq_q + (bit<20>)deq_q;
+            bit<20> avg_q = sum_q >> 1;  // Divide by 2
+            
+            // Scale to 0-255 range based on maximum link capacity
+            // Assume max queue depth is ~2048 bytes (reasonable for BMv2)
+            // This maps: avg_q / 2048 * 256 = avg_q * 256 / 2048 = avg_q * 0.125 = avg_q >> 3
+            // Result is bit<17> max, which safely fits in bit<8>
+            bit<17> scaled_util = (bit<17>)avg_q >> 3;  // Divide by 8 to scale to 256 level
+            
+            // Saturating cast to bit<8>: if scaled > 255, cap at 255
+            hdr.hula.tx_link_util = (bit<8>)(scaled_util > 255 ? 255 : scaled_util);
+        }
+    }
 }
 
 /*************************************************************************
@@ -375,8 +601,8 @@ control MyDeparser(packet_out packet, in headers hdr) {
     apply {
         packet.emit(hdr.ethernet);
         packet.emit(hdr.ipv4);
+        packet.emit(hdr.hula);      // Emit HULA before TCP (comes right after IPv4)
         packet.emit(hdr.tcp);
-        packet.emit(hdr.hula);
     }
 }
 
